@@ -1,0 +1,291 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  ECS Fargate scheduled task that runs the marketdata_loader seeder container
+  once per day against an RDS PostgreSQL instance.
+
+# ─── Parameters ───────────────────────────────────────────────────────────────
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where RDS lives
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnets (task gets a public IP for outbound internet)
+
+  RdsSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Existing RDS security group (template adds ingress rule)
+
+  RdsEndpoint:
+    Type: String
+    Description: RDS hostname
+
+  RdsPort:
+    Type: String
+    Default: "5432"
+    Description: RDS port
+
+  DatabaseName:
+    Type: String
+    Default: ml4t
+    Description: Database name
+
+  DatabaseUser:
+    Type: String
+    Default: ml4t
+    Description: Database username
+
+  DbPasswordSecretArn:
+    Type: String
+    Description: Secrets Manager ARN for DB password (plain string secret)
+
+  PolygonSecretArn:
+    Type: String
+    Description: >-
+      Secrets Manager ARN for Polygon credentials
+      (JSON: POLYGON_ACCESS_KEY_ID, POLYGON_SECRET_ACCESS_KEY, POLYGON_API_KEY)
+
+  ScheduleExpression:
+    Type: String
+    Default: "cron(0 6 ? * MON-FRI *)"
+    Description: EventBridge cron expression for the schedule
+
+  ImageTag:
+    Type: String
+    Default: latest
+    Description: GHCR image tag for the seeder container
+
+  SeedStartDate:
+    Type: String
+    Default: "2023-01-01"
+    Description: SEED_START_DATE env var
+
+  SeedOptionsDays:
+    Type: String
+    Default: "5"
+    Description: SEED_OPTIONS_DAYS env var
+
+  SeedUniverse:
+    Type: String
+    Default: SP500
+    AllowedValues:
+      - SP500
+      - RUSSELL2000
+      - BOTH
+    Description: Symbol universe to seed
+
+  EquityRefTtlDays:
+    Type: String
+    Default: "1"
+    Description: Staleness threshold in days for equity_reference rows
+
+  TaskCpu:
+    Type: String
+    Default: "512"
+    Description: Fargate CPU units
+
+  TaskMemory:
+    Type: String
+    Default: "1024"
+    Description: Fargate memory in MiB
+
+# ─── Resources ────────────────────────────────────────────────────────────────
+
+Resources:
+
+  # 1. ECS Cluster
+  SeederCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: daily-seeder
+
+  # 2. CloudWatch Log Group
+  SeederLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/daily-seeder
+      RetentionInDays: 30
+
+  # 3. Security group for the Fargate task (egress only)
+  SeederSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Seeder Fargate task - all outbound, no ingress
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+
+  # 4. Allow the seeder to reach RDS on port 5432
+  RdsIngressFromSeeder:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RdsSecurityGroupId
+      IpProtocol: tcp
+      FromPort: !Ref RdsPort
+      ToPort: !Ref RdsPort
+      SourceSecurityGroupId: !GetAtt SeederSecurityGroup.GroupId
+
+  # 5. Task Execution Role (pull image, fetch secrets, write logs)
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SeederSecrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref DbPasswordSecretArn
+                  - !Ref PolygonSecretArn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt SeederLogGroup.Arn
+
+  # 6. Task Role (container runtime — empty, Polygon uses its own S3 keys)
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+
+  # 7. ECS Task Definition
+  SeederTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: daily-seeder
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: seeder
+          Image: !Sub "779388075365.dkr.ecr.us-east-1.amazonaws.com/ml4t/seeder:${ImageTag}"
+          Essential: true
+          Environment:
+            - Name: POSTGRES_HOST
+              Value: !Ref RdsEndpoint
+            - Name: POSTGRES_PORT
+              Value: !Ref RdsPort
+            - Name: POSTGRES_DB
+              Value: !Ref DatabaseName
+            - Name: POSTGRES_USER
+              Value: !Ref DatabaseUser
+            - Name: SEED_START_DATE
+              Value: !Ref SeedStartDate
+            - Name: SEED_OPTIONS_DAYS
+              Value: !Ref SeedOptionsDays
+            - Name: SEED_UNIVERSE
+              Value: !Ref SeedUniverse
+            - Name: EQUITY_REF_TTL_DAYS
+              Value: !Ref EquityRefTtlDays
+            - Name: POLYGON_S3_ENDPOINT_URL
+              Value: "https://files.polygon.io"
+            - Name: POLYGON_S3_BUCKET_NAME
+              Value: flatfiles
+            - Name: POLYGON_API_BASE_URL
+              Value: "https://api.massive.com"
+          Secrets:
+            - Name: POSTGRES_PASSWORD
+              ValueFrom: !Ref DbPasswordSecretArn
+            - Name: POLYGON_ACCESS_KEY_ID
+              ValueFrom: !Sub "${PolygonSecretArn}:POLYGON_ACCESS_KEY_ID::"
+            - Name: POLYGON_SECRET_ACCESS_KEY
+              ValueFrom: !Sub "${PolygonSecretArn}:POLYGON_SECRET_ACCESS_KEY::"
+            - Name: POLYGON_API_KEY
+              ValueFrom: !Sub "${PolygonSecretArn}:POLYGON_API_KEY::"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref SeederLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: seeder
+
+  # 8. EventBridge rule — scheduled trigger
+  SeederScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: daily-seeder-schedule
+      Description: Trigger the seeder Fargate task on a schedule
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Id: SeederFargateTask
+          Arn: !GetAtt SeederCluster.Arn
+          RoleArn: !GetAtt EventBridgeRole.Arn
+          EcsParameters:
+            TaskDefinitionArn: !Ref SeederTaskDefinition
+            TaskCount: 1
+            LaunchType: FARGATE
+            NetworkConfiguration:
+              AwsVpcConfiguration:
+                Subnets: !Ref SubnetIds
+                SecurityGroups:
+                  - !GetAtt SeederSecurityGroup.GroupId
+                AssignPublicIp: ENABLED
+
+  # 9. IAM Role for EventBridge to invoke ECS RunTask
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EventBridgeRunTask
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:RunTask
+                Resource: !Ref SeederTaskDefinition
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !GetAtt TaskExecutionRole.Arn
+                  - !GetAtt TaskRole.Arn
+
+# ─── Outputs ──────────────────────────────────────────────────────────────────
+
+Outputs:
+  ClusterArn:
+    Description: ECS cluster ARN for manual run-task invocations
+    Value: !GetAtt SeederCluster.Arn
+
+  TaskDefinitionArn:
+    Description: Task definition ARN for manual run-task invocations
+    Value: !Ref SeederTaskDefinition
+
+  LogGroupName:
+    Description: CloudWatch log group for seeder output
+    Value: !Ref SeederLogGroup

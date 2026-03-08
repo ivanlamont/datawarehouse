@@ -60,6 +60,7 @@ def wait_for_db() -> psycopg2.extensions.connection:
             conn = psycopg2.connect(
                 host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
                 user=DB_USER, password=DB_PASS,
+                sslmode="require",
                 options="-c search_path=market_data",
             )
             log.info("Connected to PostgreSQL (schema: market_data).")
@@ -558,9 +559,77 @@ def _float(val) -> float | None:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def _ensure_schema(conn) -> None:
+    """Create the market_data schema and tables if they don't already exist."""
+    ddl = """
+    CREATE SCHEMA IF NOT EXISTS market_data;
+    SET search_path TO market_data;
+
+    CREATE TABLE IF NOT EXISTS equity_reference (
+        symbol             VARCHAR(20) PRIMARY KEY,
+        name               VARCHAR(255),
+        exchange           VARCHAR(50),
+        sector             VARCHAR(100),
+        industry           VARCHAR(150),
+        currency           VARCHAR(10),
+        market_cap         BIGINT,
+        shares_outstanding BIGINT,
+        updated_at         TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS equity_pricing (
+        symbol    VARCHAR(20)      NOT NULL,
+        ts        TIMESTAMPTZ      NOT NULL,
+        open      DOUBLE PRECISION,
+        high      DOUBLE PRECISION,
+        low       DOUBLE PRECISION,
+        close     DOUBLE PRECISION,
+        volume    DOUBLE PRECISION,
+        adj_close DOUBLE PRECISION,
+        PRIMARY KEY (symbol, ts)
+    );
+    CREATE INDEX IF NOT EXISTS equity_pricing_symbol_ts_idx
+        ON equity_pricing (symbol, ts DESC);
+
+    CREATE TABLE IF NOT EXISTS options_reference (
+        contract_symbol VARCHAR(30) PRIMARY KEY,
+        underlying      VARCHAR(20)      NOT NULL,
+        strike          DOUBLE PRECISION NOT NULL,
+        expiry          DATE             NOT NULL,
+        option_type     CHAR(1)          NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS options_reference_underlying_idx
+        ON options_reference (underlying);
+
+    CREATE TABLE IF NOT EXISTS options_pricing (
+        contract_symbol    VARCHAR(30)      NOT NULL,
+        ts                 TIMESTAMPTZ      NOT NULL,
+        underlying         VARCHAR(20)      NOT NULL,
+        bid                DOUBLE PRECISION,
+        ask                DOUBLE PRECISION,
+        last_price         DOUBLE PRECISION,
+        volume             DOUBLE PRECISION,
+        open_interest      DOUBLE PRECISION,
+        implied_volatility DOUBLE PRECISION,
+        delta              DOUBLE PRECISION,
+        gamma              DOUBLE PRECISION,
+        theta              DOUBLE PRECISION,
+        vega               DOUBLE PRECISION,
+        PRIMARY KEY (contract_symbol, ts)
+    );
+    CREATE INDEX IF NOT EXISTS options_pricing_underlying_ts_idx
+        ON options_pricing (underlying, ts DESC);
+    """
+    with conn.cursor() as cur:
+        cur.execute(ddl)
+    conn.commit()
+    log.info("Schema market_data: ensured schema and tables exist.")
+
+
 def main() -> None:
     conn = wait_for_db()
     try:
+        _ensure_schema(conn)
         symbols = get_symbols()
         symbol_set = set(symbols)
 

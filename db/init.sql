@@ -52,3 +52,5 @@ CREATE TABLE options_pricing (
     PRIMARY KEY (contract_symbol, ts)
 );
 CREATE INDEX ON options_pricing (underlying, ts DESC);
+
+
