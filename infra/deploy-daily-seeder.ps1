@@ -14,4 +14,6 @@ aws cloudformation deploy `
     DatabaseUser=investrlotadmin `
     DbPasswordSecretArn=arn:aws:secretsmanager:us-east-1:779388075365:secret:investrlot/production/database/password-MW4OY3 `
     PolygonSecretArn=arn:aws:secretsmanager:us-east-1:779388075365:secret:ml4t/polygon-credentials-9D88iv `
-    SeedUniverse=BOTH
+    SeedUniverse=BOTH `
+    TiingoSecretArn=arn:aws:secretsmanager:us-east-1:779388075365:secret:ml4t/tiingo-api-key-Mj0mUE
+    

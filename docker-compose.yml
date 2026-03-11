@@ -38,6 +38,8 @@ services:
       SEED_UNIVERSE: ${SEED_UNIVERSE:-SP500}
       EQUITY_REF_TTL_DAYS: ${EQUITY_REF_TTL_DAYS:-1}
       SEED_SYMBOLS: ${SEED_SYMBOLS:-}
+      TIINGO_API_KEY: ${TIINGO_API_KEY:-}
+      SEED_FX_PAIRS: ${SEED_FX_PAIRS:-eurusd,gbpusd,usdjpy,usdchf,usdcad,audusd,nzdusd}
     restart: on-failure
 
   app:

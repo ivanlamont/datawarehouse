@@ -1,8 +1,10 @@
 """
-Seeder: fetches S&P 500 equity + options data and writes to PostgreSQL.
+Seeder: fetches S&P 500 equity + options data and FX rates, writes to PostgreSQL.
 
 Equity data: yfinance (free)
-Options data: Polygon flat files via S3/boto3
+Options data: Polygon flat files via S3/boto3 (reference + pricing),
+              yfinance (daily pricing snapshots — bid/ask/last/volume/OI/IV)
+FX data: Tiingo REST API
 """
 
 import csv
@@ -38,6 +40,7 @@ DB_PORT = int(os.environ.get("POSTGRES_PORT", 5432))
 DB_NAME = os.environ["POSTGRES_DB"]
 DB_USER = os.environ["POSTGRES_USER"]
 DB_PASS = os.environ["POSTGRES_PASSWORD"]
+DB_SSLMODE = os.environ.get("POSTGRES_SSLMODE", "prefer")
 
 POLYGON_ACCESS_KEY_ID = os.environ.get("POLYGON_ACCESS_KEY_ID", "")
 POLYGON_SECRET_ACCESS_KEY = os.environ.get("POLYGON_SECRET_ACCESS_KEY", "")
@@ -50,6 +53,14 @@ SEED_UNIVERSE = os.environ.get("SEED_UNIVERSE", "SP500").upper()
 # How many days before equity_reference rows are considered stale (default: 1)
 EQUITY_REF_TTL_DAYS = int(os.environ.get("EQUITY_REF_TTL_DAYS", 1))
 
+# Tiingo FX
+TIINGO_API_KEY = os.environ.get("TIINGO_API_KEY", "")
+# Comma-separated currency pairs, e.g. "eurusd,gbpusd,usdjpy"
+SEED_FX_PAIRS = os.environ.get(
+    "SEED_FX_PAIRS",
+    "eurusd,gbpusd,usdjpy,usdchf,usdcad,audusd,nzdusd",
+)
+
 
 # ── DB connection ─────────────────────────────────────────────────────────────
 
@@ -60,7 +71,7 @@ def wait_for_db() -> psycopg2.extensions.connection:
             conn = psycopg2.connect(
                 host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
                 user=DB_USER, password=DB_PASS,
-                sslmode="require",
+                sslmode=DB_SSLMODE,
                 options="-c search_path=market_data",
             )
             log.info("Connected to PostgreSQL (schema: market_data).")
@@ -557,6 +568,187 @@ def _float(val) -> float | None:
         return None
 
 
+# ── Options pricing via yfinance ──────────────────────────────────────────
+
+def seed_options_pricing_yfinance(conn, universe: set[str]) -> None:
+    """
+    Pull current options chains from yfinance for each underlying and upsert
+    bid, ask, last_price, volume, open_interest, and implied_volatility into
+    options_reference + options_pricing.
+
+    yfinance only provides the *current* chain (no historical), so this
+    accumulates daily snapshots over time as the cron job runs each day.
+    """
+    log.info("Seeding options pricing via yfinance for %d underlyings…", len(universe))
+    total_ref = 0
+    total_pricing = 0
+    today_ts = datetime.combine(date.today(), datetime.min.time())
+
+    for i, sym in enumerate(sorted(universe), 1):
+        try:
+            ticker = yf.Ticker(sym)
+            expirations = ticker.options  # tuple of date strings
+            if not expirations:
+                continue
+
+            ref_rows: list[tuple] = []
+            pricing_rows: list[tuple] = []
+
+            for exp_str in expirations:
+                try:
+                    chain = ticker.option_chain(exp_str)
+                except Exception:
+                    continue
+
+                exp_date = date.fromisoformat(exp_str)
+
+                for opt_type, df in [("C", chain.calls), ("P", chain.puts)]:
+                    if df is None or df.empty:
+                        continue
+                    for _, row in df.iterrows():
+                        contract = row.get("contractSymbol", "")
+                        if not contract:
+                            continue
+                        strike = _float(row.get("strike"))
+                        bid = _float(row.get("bid"))
+                        ask = _float(row.get("ask"))
+                        last = _float(row.get("lastPrice"))
+                        vol = _float(row.get("volume"))
+                        oi = _float(row.get("openInterest"))
+                        iv = _float(row.get("impliedVolatility"))
+
+                        ref_rows.append((contract, sym, strike, exp_date, opt_type))
+                        pricing_rows.append((
+                            contract, today_ts, sym,
+                            bid, ask, last, vol, oi, iv,
+                            None, None, None, None,  # greeks not available
+                        ))
+
+            if ref_rows:
+                with conn.cursor() as cur:
+                    psycopg2.extras.execute_values(
+                        cur,
+                        """
+                        INSERT INTO options_reference
+                            (contract_symbol, underlying, strike, expiry, option_type)
+                        VALUES %s
+                        ON CONFLICT (contract_symbol) DO NOTHING
+                        """,
+                        ref_rows,
+                    )
+                conn.commit()
+                total_ref += len(ref_rows)
+
+            if pricing_rows:
+                with conn.cursor() as cur:
+                    psycopg2.extras.execute_values(
+                        cur,
+                        """
+                        INSERT INTO options_pricing
+                            (contract_symbol, ts, underlying, bid, ask, last_price,
+                             volume, open_interest, implied_volatility,
+                             delta, gamma, theta, vega)
+                        VALUES %s
+                        ON CONFLICT (contract_symbol, ts) DO UPDATE SET
+                            bid                = EXCLUDED.bid,
+                            ask                = EXCLUDED.ask,
+                            last_price         = EXCLUDED.last_price,
+                            volume             = EXCLUDED.volume,
+                            open_interest      = EXCLUDED.open_interest,
+                            implied_volatility = EXCLUDED.implied_volatility
+                        """,
+                        pricing_rows,
+                    )
+                conn.commit()
+                total_pricing += len(pricing_rows)
+
+            if i % 25 == 0:
+                log.info(
+                    "  yfinance options: %d/%d underlyings, %d ref / %d pricing rows",
+                    i, len(universe), total_ref, total_pricing,
+                )
+        except Exception as exc:
+            log.warning("  yfinance options skipping %s: %s", sym, exc)
+
+    log.info(
+        "yfinance options: upserted %d reference, %d pricing rows total.",
+        total_ref, total_pricing,
+    )
+
+
+# ── FX rates (Tiingo) ─────────────────────────────────────────────────────
+
+def seed_fx_rates(conn) -> None:
+    """Fetch daily FX rates from the Tiingo API and upsert into fx_rates."""
+    if not TIINGO_API_KEY:
+        log.warning("TIINGO_API_KEY not set; skipping FX rate seeding.")
+        return
+
+    pairs = [p.strip().lower() for p in SEED_FX_PAIRS.split(",") if p.strip()]
+    if not pairs:
+        log.info("SEED_FX_PAIRS is empty; skipping FX rate seeding.")
+        return
+
+    log.info("Seeding FX rates for %d pairs from %s: %s", len(pairs), SEED_START_DATE, pairs)
+    total = 0
+
+    for pair in pairs:
+        url = f"https://api.tiingo.com/tiingo/fx/{pair}/prices"
+        params = {
+            "startDate": SEED_START_DATE,
+            "resampleFreq": "1day",
+            "token": TIINGO_API_KEY,
+        }
+        try:
+            resp = requests.get(url, params=params, timeout=60,
+                                headers={"Content-Type": "application/json"})
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            log.warning("  FX skipping %s: %s", pair, exc)
+            continue
+
+        if not data:
+            log.info("  FX %s: no data returned.", pair)
+            continue
+
+        pair_upper = pair.upper()
+        rows = []
+        for rec in data:
+            ts = rec.get("date")
+            if not ts:
+                continue
+            rows.append((
+                pair_upper,
+                ts,
+                _float(rec.get("open")),
+                _float(rec.get("high")),
+                _float(rec.get("low")),
+                _float(rec.get("close")),
+            ))
+
+        if rows:
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_values(
+                    cur,
+                    """
+                    INSERT INTO fx_rates (pair, ts, open, high, low, close)
+                    VALUES %s
+                    ON CONFLICT (pair, ts) DO UPDATE SET
+                        open  = EXCLUDED.open,
+                        high  = EXCLUDED.high,
+                        low   = EXCLUDED.low,
+                        close = EXCLUDED.close
+                    """,
+                    rows,
+                )
+            conn.commit()
+            total += len(rows)
+            log.info("  FX %s: upserted %d rows.", pair_upper, len(rows))
+
+    log.info("fx_rates: upserted %d rows total.", total)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def _ensure_schema(conn) -> None:
@@ -619,6 +811,18 @@ def _ensure_schema(conn) -> None:
     );
     CREATE INDEX IF NOT EXISTS options_pricing_underlying_ts_idx
         ON options_pricing (underlying, ts DESC);
+
+    CREATE TABLE IF NOT EXISTS fx_rates (
+        pair  VARCHAR(10)      NOT NULL,
+        ts    TIMESTAMPTZ      NOT NULL,
+        open  DOUBLE PRECISION,
+        high  DOUBLE PRECISION,
+        low   DOUBLE PRECISION,
+        close DOUBLE PRECISION,
+        PRIMARY KEY (pair, ts)
+    );
+    CREATE INDEX IF NOT EXISTS fx_rates_pair_ts_idx
+        ON fx_rates (pair, ts DESC);
     """
     with conn.cursor() as cur:
         cur.execute(ddl)
@@ -636,6 +840,8 @@ def main() -> None:
         seed_equity_reference(conn, symbols)
         seed_equity_pricing(conn, symbols)
         seed_options(conn, symbol_set)
+        seed_options_pricing_yfinance(conn, symbol_set)
+        seed_fx_rates(conn)
 
         log.info("Seeding complete.")
     finally:

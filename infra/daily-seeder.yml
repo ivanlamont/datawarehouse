@@ -47,6 +47,18 @@ Parameters:
       Secrets Manager ARN for Polygon credentials
       (JSON: POLYGON_ACCESS_KEY_ID, POLYGON_SECRET_ACCESS_KEY, POLYGON_API_KEY)
 
+  TiingoSecretArn:
+    Type: String
+    Default: ""
+    Description: >-
+      Secrets Manager ARN for Tiingo API key (plain string secret).
+      Leave empty to skip FX rate seeding.
+
+  SeedFxPairs:
+    Type: String
+    Default: "eurusd,gbpusd,usdjpy,usdchf,usdcad,audusd,nzdusd"
+    Description: Comma-separated FX pairs to seed from Tiingo
+
   ScheduleExpression:
     Type: String
     Default: "cron(0 6 ? * MON-FRI *)"
@@ -90,6 +102,11 @@ Parameters:
     Type: String
     Default: "1024"
     Description: Fargate memory in MiB
+
+# ─── Conditions ───────────────────────────────────────────────────────────────
+
+Conditions:
+  HasTiingoSecret: !Not [!Equals [!Ref TiingoSecretArn, ""]]
 
 # ─── Resources ────────────────────────────────────────────────────────────────
 
@@ -152,6 +169,10 @@ Resources:
                 Resource:
                   - !Ref DbPasswordSecretArn
                   - !Ref PolygonSecretArn
+                  - !If
+                    - HasTiingoSecret
+                    - !Ref TiingoSecretArn
+                    - !Ref "AWS::NoValue"
               - Effect: Allow
                 Action:
                   - logs:CreateLogStream
@@ -209,6 +230,10 @@ Resources:
               Value: flatfiles
             - Name: POLYGON_API_BASE_URL
               Value: "https://api.massive.com"
+            - Name: POSTGRES_SSLMODE
+              Value: require
+            - Name: SEED_FX_PAIRS
+              Value: !Ref SeedFxPairs
           Secrets:
             - Name: POSTGRES_PASSWORD
               ValueFrom: !Ref DbPasswordSecretArn
@@ -218,6 +243,11 @@ Resources:
               ValueFrom: !Sub "${PolygonSecretArn}:POLYGON_SECRET_ACCESS_KEY::"
             - Name: POLYGON_API_KEY
               ValueFrom: !Sub "${PolygonSecretArn}:POLYGON_API_KEY::"
+            - !If
+              - HasTiingoSecret
+              - Name: TIINGO_API_KEY
+                ValueFrom: !Ref TiingoSecretArn
+              - !Ref "AWS::NoValue"
           LogConfiguration:
             LogDriver: awslogs
             Options:

@@ -53,4 +53,13 @@ CREATE TABLE options_pricing (
 );
 CREATE INDEX ON options_pricing (underlying, ts DESC);
 
-
+CREATE TABLE fx_rates (
+    pair  VARCHAR(10)      NOT NULL,
+    ts    TIMESTAMPTZ      NOT NULL,
+    open  DOUBLE PRECISION,
+    high  DOUBLE PRECISION,
+    low   DOUBLE PRECISION,
+    close DOUBLE PRECISION,
+    PRIMARY KEY (pair, ts)
+);
+CREATE INDEX ON fx_rates (pair, ts DESC);
