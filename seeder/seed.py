@@ -255,7 +255,7 @@ def seed_equity_pricing(conn, symbols: list[str]) -> None:
             rows = [
                 (
                     sym,
-                    row["date"].to_pydatetime() if hasattr(row["date"], "to_pydatetime") else row["date"],
+                    row["date"].date() if hasattr(row["date"], "date") else row["date"],
                     _float(row.get("open")),
                     _float(row.get("high")),
                     _float(row.get("low")),
@@ -336,7 +336,6 @@ def _parse_flat_file_rows(
     """Decompress and parse a Polygon day-aggs CSV.gz into ref + pricing rows."""
     ref_rows: list[tuple] = []
     pricing_rows: list[tuple] = []
-    ts = datetime(day.year, day.month, day.day)
     with gzip.open(io.BytesIO(compressed), "rt", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -350,7 +349,7 @@ def _parse_flat_file_rows(
             ref_rows.append((contract, underlying, strike, expiry, option_type))
             pricing_rows.append((
                 contract,
-                ts,
+                day,
                 underlying,
                 None,  # bid (not in day_aggs)
                 None,  # ask
@@ -430,7 +429,6 @@ def _seed_options_via_api(conn, universe: set[str], trade_date: date) -> None:
 
     ref_rows: list[tuple] = []
     pricing_rows: list[tuple] = []
-    ts = datetime(trade_date.year, trade_date.month, trade_date.day)
 
     for i, sym in enumerate(sorted(symbols_to_fetch), 1):
         try:
@@ -452,7 +450,7 @@ def _seed_options_via_api(conn, universe: set[str], trade_date: date) -> None:
                 # Reference endpoint carries no pricing; insert a NULL pricing row
                 # so the contract is represented at this trade date.
                 pricing_rows.append((
-                    contract, ts, sym,
+                    contract, trade_date, sym,
                     None, None, None, None, None, None,
                     None, None, None, None,
                 ))
@@ -582,7 +580,7 @@ def seed_options_pricing_yfinance(conn, universe: set[str]) -> None:
     log.info("Seeding options pricing via yfinance for %d underlyings…", len(universe))
     total_ref = 0
     total_pricing = 0
-    today_ts = datetime.combine(date.today(), datetime.min.time())
+    today_ts = date.today()
 
     for i, sym in enumerate(sorted(universe), 1):
         try:
@@ -771,7 +769,7 @@ def _ensure_schema(conn) -> None:
 
     CREATE TABLE IF NOT EXISTS equity_pricing (
         symbol    VARCHAR(20)      NOT NULL,
-        ts        TIMESTAMPTZ      NOT NULL,
+        ts        DATE             NOT NULL,
         open      DOUBLE PRECISION,
         high      DOUBLE PRECISION,
         low       DOUBLE PRECISION,
@@ -795,7 +793,7 @@ def _ensure_schema(conn) -> None:
 
     CREATE TABLE IF NOT EXISTS options_pricing (
         contract_symbol    VARCHAR(30)      NOT NULL,
-        ts                 TIMESTAMPTZ      NOT NULL,
+        ts                 DATE             NOT NULL,
         underlying         VARCHAR(20)      NOT NULL,
         bid                DOUBLE PRECISION,
         ask                DOUBLE PRECISION,
@@ -837,16 +835,119 @@ def main() -> None:
         symbols = get_symbols()
         symbol_set = set(symbols)
 
-        seed_equity_reference(conn, symbols)
-        seed_equity_pricing(conn, symbols)
-        seed_options(conn, symbol_set)
-        seed_options_pricing_yfinance(conn, symbol_set)
-        seed_fx_rates(conn)
+        steps: list[tuple[str, callable]] = [
+            ("equity_reference", lambda: seed_equity_reference(conn, symbols)),
+            ("equity_pricing", lambda: seed_equity_pricing(conn, symbols)),
+            ("options", lambda: seed_options(conn, symbol_set)),
+            ("options_pricing_yfinance", lambda: seed_options_pricing_yfinance(conn, symbol_set)),
+            ("fx_rates", lambda: seed_fx_rates(conn)),
+        ]
+        failures = []
+        for name, step in steps:
+            try:
+                step()
+            except Exception:
+                log.exception("Seed step '%s' failed; continuing with remaining steps.", name)
+                failures.append(name)
 
-        log.info("Seeding complete.")
+        if failures:
+            log.error("Seeding finished with failures: %s", ", ".join(failures))
+            sys.exit(1)
+        else:
+            log.info("Seeding complete.")
     finally:
         conn.close()
 
 
+SEED_LOOKBACK_DAYS = int(os.environ.get("SEED_LOOKBACK_DAYS", 7))
+
+
+def _needs_seed(conn) -> tuple[bool, bool]:
+    """Return (needs_equity, needs_options) flags."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            WITH recent_weekdays AS (
+                SELECT d::date AS trade_date
+                FROM   generate_series(
+                           CURRENT_DATE - %s,
+                           CURRENT_DATE,
+                           '1 day'::interval
+                       ) AS d
+                WHERE  EXTRACT(DOW FROM d) BETWEEN 1 AND 5  -- Mon=1 … Fri=5
+            )
+            SELECT rw.trade_date
+            FROM   recent_weekdays rw
+            LEFT JOIN (
+                SELECT DISTINCT ts::date AS pricing_date
+                FROM   market_data.equity_pricing
+                WHERE  ts >= CURRENT_DATE - %s
+            ) ep ON ep.pricing_date = rw.trade_date
+            WHERE  ep.pricing_date IS NULL
+            ORDER  BY rw.trade_date
+            """,
+            (SEED_LOOKBACK_DAYS, SEED_LOOKBACK_DAYS),
+        )
+        missing_equity = [row[0].isoformat() for row in cur.fetchall()]
+
+        cur.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM market_data.options_pricing
+                WHERE  ts = CURRENT_DATE
+                LIMIT  1
+            )
+            """,
+        )
+        has_today_options = cur.fetchone()[0]
+
+    needs_equity = bool(missing_equity)
+    needs_options = not has_today_options
+
+    if needs_equity:
+        log.info("Missing equity data for %d day(s) in the last %d: %s",
+                 len(missing_equity), SEED_LOOKBACK_DAYS, missing_equity)
+    if needs_options:
+        log.info("No options pricing snapshot for today.")
+    if not needs_equity and not needs_options:
+        log.info("Equity data and today's options snapshot are up to date; skipping.")
+
+    return needs_equity, needs_options
+
+
+# ── Scheduling interval (seconds) ────────────────────────────────────────────
+SEED_INTERVAL = int(os.environ.get("SEED_INTERVAL_SECONDS", 0))
+
+
+def run_scheduler() -> None:
+    """Run the seeder in a loop, checking every SEED_INTERVAL seconds."""
+    log.info("Scheduler mode: checking every %d seconds.", SEED_INTERVAL)
+    while True:
+        conn = wait_for_db()
+        try:
+            _ensure_schema(conn)
+            needs_equity, needs_options = _needs_seed(conn)
+            if needs_equity:
+                conn.close()
+                main()
+            elif needs_options:
+                symbols = get_symbols()
+                seed_options_pricing_yfinance(conn, set(symbols))
+                conn.close()
+            else:
+                conn.close()
+        except Exception:
+            log.exception("Scheduler tick failed.")
+            try:
+                conn.close()
+            except Exception:
+                pass
+        log.info("Sleeping %d seconds until next check…", SEED_INTERVAL)
+        time.sleep(SEED_INTERVAL)
+
+
 if __name__ == "__main__":
-    main()
+    if SEED_INTERVAL > 0:
+        run_scheduler()
+    else:
+        main()

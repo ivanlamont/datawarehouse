@@ -15,6 +15,7 @@ services:
       retries: 10
     ports:
       - "5490:5432"
+    restart: unless-stopped
 
   seeder:
     build: ./seeder
@@ -35,12 +36,13 @@ services:
       POLYGON_API_KEY: ${POLYGON_API_KEY:-}
       SEED_START_DATE: ${SEED_START_DATE:-2023-01-01}
       SEED_OPTIONS_DAYS: ${SEED_OPTIONS_DAYS:-5}
-      SEED_UNIVERSE: ${SEED_UNIVERSE:-SP500}
+      SEED_UNIVERSE: ${SEED_UNIVERSE:-BOTH}
       EQUITY_REF_TTL_DAYS: ${EQUITY_REF_TTL_DAYS:-1}
       SEED_SYMBOLS: ${SEED_SYMBOLS:-}
       TIINGO_API_KEY: ${TIINGO_API_KEY:-}
       SEED_FX_PAIRS: ${SEED_FX_PAIRS:-eurusd,gbpusd,usdjpy,usdchf,usdcad,audusd,nzdusd}
-    restart: on-failure
+      SEED_INTERVAL_SECONDS: ${SEED_INTERVAL_SECONDS:-86400}
+    restart: unless-stopped
 
   app:
     build: .

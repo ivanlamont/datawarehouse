@@ -61,8 +61,8 @@ Parameters:
 
   ScheduleExpression:
     Type: String
-    Default: "cron(0 6 ? * MON-FRI *)"
-    Description: EventBridge cron expression for the schedule
+    Default: "cron(0 0 ? * TUE-SAT *)"
+    Description: EventBridge cron expression for the schedule (midnight UTC = 5 PM PDT T-0)
 
   ImageTag:
     Type: String

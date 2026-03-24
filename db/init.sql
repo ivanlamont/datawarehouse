@@ -15,7 +15,7 @@ CREATE TABLE equity_reference (
 
 CREATE TABLE equity_pricing (
     symbol    VARCHAR(20)      NOT NULL,
-    ts        TIMESTAMPTZ      NOT NULL,
+    ts        DATE             NOT NULL,
     open      DOUBLE PRECISION,
     high      DOUBLE PRECISION,
     low       DOUBLE PRECISION,
@@ -37,7 +37,7 @@ CREATE INDEX ON options_reference (underlying);
 
 CREATE TABLE options_pricing (
     contract_symbol    VARCHAR(30)      NOT NULL,
-    ts                 TIMESTAMPTZ      NOT NULL,
+    ts                 DATE             NOT NULL,
     underlying         VARCHAR(20)      NOT NULL,
     bid                DOUBLE PRECISION,
     ask                DOUBLE PRECISION,
