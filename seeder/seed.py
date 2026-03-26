@@ -667,6 +667,7 @@ def seed_options_pricing_yfinance(conn, universe: set[str]) -> None:
                 )
         except Exception as exc:
             log.warning("  yfinance options skipping %s: %s", sym, exc)
+            conn.rollback()
 
     log.info(
         "yfinance options: upserted %d reference, %d pricing rows total.",
