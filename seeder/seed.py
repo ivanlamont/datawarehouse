@@ -131,7 +131,11 @@ def get_symbols() -> list[str]:
         return _fetch_russell2000()
     elif SEED_UNIVERSE == "BOTH":
         sp500 = _fetch_sp500()
-        r2000 = _fetch_russell2000()
+        try:
+            r2000 = _fetch_russell2000()
+        except Exception as exc:
+            log.warning("Russell 2000 fetch failed, falling back to S&P 500 only: %s", exc)
+            return sp500
         combined = list(dict.fromkeys(sp500 + r2000))  # deduplicate, preserve order
         log.info("Combined universe: %d symbols.", len(combined))
         return combined
@@ -559,6 +563,18 @@ def seed_options(conn, universe: set[str]) -> None:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+
+def _last_trading_day() -> date:
+    """Return today if it's a weekday, otherwise the most recent Friday."""
+    today = date.today()
+    wd = today.weekday()  # Mon=0, Sun=6
+    if wd == 5:  # Saturday
+        return today - timedelta(days=1)
+    elif wd == 6:  # Sunday
+        return today - timedelta(days=2)
+    return today
+
+
 def _float(val) -> float | None:
     try:
         return float(val) if val is not None else None
@@ -567,6 +583,75 @@ def _float(val) -> float | None:
 
 
 # ── Options pricing via yfinance ──────────────────────────────────────────
+
+def _fetch_yf_options(sym: str, today_ts: date) -> tuple[list[tuple], list[tuple]]:
+    """Fetch options chain for one symbol, returning (ref_rows, pricing_rows)."""
+    ticker = yf.Ticker(sym)
+    expirations = ticker.options  # tuple of date strings
+    if not expirations:
+        return [], []
+
+    ref_rows: list[tuple] = []
+    pricing_rows: list[tuple] = []
+
+    for exp_str in expirations:
+        try:
+            chain = ticker.option_chain(exp_str)
+        except Exception:
+            continue
+
+        exp_date = date.fromisoformat(exp_str)
+
+        for opt_type, df in [("C", chain.calls), ("P", chain.puts)]:
+            if df is None or df.empty:
+                continue
+            for _, row in df.iterrows():
+                contract = row.get("contractSymbol", "")
+                if not contract:
+                    continue
+                ref_rows.append((contract, sym, _float(row.get("strike")), exp_date, opt_type))
+                pricing_rows.append((
+                    contract, today_ts, sym,
+                    _float(row.get("bid")), _float(row.get("ask")),
+                    _float(row.get("lastPrice")), _float(row.get("volume")),
+                    _float(row.get("openInterest")), _float(row.get("impliedVolatility")),
+                    None, None, None, None,
+                ))
+
+    return ref_rows, pricing_rows
+
+
+def _upsert_yf_options(conn, ref_rows: list[tuple], pricing_rows: list[tuple]) -> tuple[int, int]:
+    """Upsert ref + pricing rows, returning counts inserted."""
+    ref_count = 0
+    pricing_count = 0
+    if ref_rows:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_values(cur, """
+                INSERT INTO options_reference
+                    (contract_symbol, underlying, strike, expiry, option_type)
+                VALUES %s ON CONFLICT (contract_symbol) DO NOTHING
+            """, ref_rows)
+        conn.commit()
+        ref_count = len(ref_rows)
+    if pricing_rows:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_values(cur, """
+                INSERT INTO options_pricing
+                    (contract_symbol, ts, underlying, bid, ask, last_price,
+                     volume, open_interest, implied_volatility,
+                     delta, gamma, theta, vega)
+                VALUES %s
+                ON CONFLICT (contract_symbol, ts) DO UPDATE SET
+                    bid = EXCLUDED.bid, ask = EXCLUDED.ask,
+                    last_price = EXCLUDED.last_price, volume = EXCLUDED.volume,
+                    open_interest = EXCLUDED.open_interest,
+                    implied_volatility = EXCLUDED.implied_volatility
+            """, pricing_rows)
+        conn.commit()
+        pricing_count = len(pricing_rows)
+    return ref_count, pricing_count
+
 
 def seed_options_pricing_yfinance(conn, universe: set[str]) -> None:
     """
@@ -580,85 +665,16 @@ def seed_options_pricing_yfinance(conn, universe: set[str]) -> None:
     log.info("Seeding options pricing via yfinance for %d underlyings…", len(universe))
     total_ref = 0
     total_pricing = 0
-    today_ts = date.today()
+    today_ts = _last_trading_day()
 
     for i, sym in enumerate(sorted(universe), 1):
+        if i > 1:
+            time.sleep(0.5)  # throttle to avoid yfinance rate limits
         try:
-            ticker = yf.Ticker(sym)
-            expirations = ticker.options  # tuple of date strings
-            if not expirations:
-                continue
-
-            ref_rows: list[tuple] = []
-            pricing_rows: list[tuple] = []
-
-            for exp_str in expirations:
-                try:
-                    chain = ticker.option_chain(exp_str)
-                except Exception:
-                    continue
-
-                exp_date = date.fromisoformat(exp_str)
-
-                for opt_type, df in [("C", chain.calls), ("P", chain.puts)]:
-                    if df is None or df.empty:
-                        continue
-                    for _, row in df.iterrows():
-                        contract = row.get("contractSymbol", "")
-                        if not contract:
-                            continue
-                        strike = _float(row.get("strike"))
-                        bid = _float(row.get("bid"))
-                        ask = _float(row.get("ask"))
-                        last = _float(row.get("lastPrice"))
-                        vol = _float(row.get("volume"))
-                        oi = _float(row.get("openInterest"))
-                        iv = _float(row.get("impliedVolatility"))
-
-                        ref_rows.append((contract, sym, strike, exp_date, opt_type))
-                        pricing_rows.append((
-                            contract, today_ts, sym,
-                            bid, ask, last, vol, oi, iv,
-                            None, None, None, None,  # greeks not available
-                        ))
-
-            if ref_rows:
-                with conn.cursor() as cur:
-                    psycopg2.extras.execute_values(
-                        cur,
-                        """
-                        INSERT INTO options_reference
-                            (contract_symbol, underlying, strike, expiry, option_type)
-                        VALUES %s
-                        ON CONFLICT (contract_symbol) DO NOTHING
-                        """,
-                        ref_rows,
-                    )
-                conn.commit()
-                total_ref += len(ref_rows)
-
-            if pricing_rows:
-                with conn.cursor() as cur:
-                    psycopg2.extras.execute_values(
-                        cur,
-                        """
-                        INSERT INTO options_pricing
-                            (contract_symbol, ts, underlying, bid, ask, last_price,
-                             volume, open_interest, implied_volatility,
-                             delta, gamma, theta, vega)
-                        VALUES %s
-                        ON CONFLICT (contract_symbol, ts) DO UPDATE SET
-                            bid                = EXCLUDED.bid,
-                            ask                = EXCLUDED.ask,
-                            last_price         = EXCLUDED.last_price,
-                            volume             = EXCLUDED.volume,
-                            open_interest      = EXCLUDED.open_interest,
-                            implied_volatility = EXCLUDED.implied_volatility
-                        """,
-                        pricing_rows,
-                    )
-                conn.commit()
-                total_pricing += len(pricing_rows)
+            ref_rows, pricing_rows = _fetch_yf_options(sym, today_ts)
+            r, p = _upsert_yf_options(conn, ref_rows, pricing_rows)
+            total_ref += r
+            total_pricing += p
 
             if i % 25 == 0:
                 log.info(
@@ -666,7 +682,21 @@ def seed_options_pricing_yfinance(conn, universe: set[str]) -> None:
                     i, len(universe), total_ref, total_pricing,
                 )
         except Exception as exc:
-            log.warning("  yfinance options skipping %s: %s", sym, exc)
+            conn.rollback()
+            msg = str(exc)
+            if "Too Many Requests" in msg or "Rate limited" in msg:
+                log.warning("  yfinance rate limited at %s, backing off 30s…", sym)
+                time.sleep(30)
+                try:
+                    ref_rows, pricing_rows = _fetch_yf_options(sym, today_ts)
+                    r, p = _upsert_yf_options(conn, ref_rows, pricing_rows)
+                    total_ref += r
+                    total_pricing += p
+                except Exception as retry_exc:
+                    log.warning("  yfinance retry failed for %s: %s", sym, retry_exc)
+                    conn.rollback()
+            else:
+                log.warning("  yfinance options skipping %s: %s", sym, exc)
 
     log.info(
         "yfinance options: upserted %d reference, %d pricing rows total.",
@@ -894,10 +924,11 @@ def _needs_seed(conn) -> tuple[bool, bool]:
             """
             SELECT EXISTS (
                 SELECT 1 FROM market_data.options_pricing
-                WHERE  ts = CURRENT_DATE
+                WHERE  ts = %s
                 LIMIT  1
             )
             """,
+            (_last_trading_day(),),
         )
         has_today_options = cur.fetchone()[0]
 
@@ -942,8 +973,13 @@ def run_scheduler() -> None:
                 conn.close()
             except Exception:
                 pass
-        log.info("Sleeping %d seconds until next check…", SEED_INTERVAL)
-        time.sleep(SEED_INTERVAL)
+        log.info("Next check in %d seconds (wall-clock aware).", SEED_INTERVAL)
+        next_run = time.time() + SEED_INTERVAL
+        while True:
+            remaining = next_run - time.time()
+            if remaining <= 0:
+                break
+            time.sleep(min(60, remaining))
 
 
 if __name__ == "__main__":
