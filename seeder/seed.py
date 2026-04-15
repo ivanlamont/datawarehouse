@@ -667,36 +667,45 @@ def seed_options_pricing_yfinance(conn, universe: set[str]) -> None:
     total_pricing = 0
     today_ts = _last_trading_day()
 
+    backoff_schedule = (60, 120, 240, 480)
+
     for i, sym in enumerate(sorted(universe), 1):
         if i > 1:
             time.sleep(0.5)  # throttle to avoid yfinance rate limits
-        try:
-            ref_rows, pricing_rows = _fetch_yf_options(sym, today_ts)
-            r, p = _upsert_yf_options(conn, ref_rows, pricing_rows)
-            total_ref += r
-            total_pricing += p
 
-            if i % 25 == 0:
-                log.info(
-                    "  yfinance options: %d/%d underlyings, %d ref / %d pricing rows",
-                    i, len(universe), total_ref, total_pricing,
+        attempt = 0
+        while True:
+            try:
+                ref_rows, pricing_rows = _fetch_yf_options(sym, today_ts)
+                r, p = _upsert_yf_options(conn, ref_rows, pricing_rows)
+                total_ref += r
+                total_pricing += p
+                break
+            except Exception as exc:
+                conn.rollback()
+                msg = str(exc)
+                is_rate_limited = (
+                    "Too Many Requests" in msg
+                    or "Rate limited" in msg
+                    or "YFRateLimitError" in type(exc).__name__
                 )
-        except Exception as exc:
-            conn.rollback()
-            msg = str(exc)
-            if "Too Many Requests" in msg or "Rate limited" in msg:
-                log.warning("  yfinance rate limited at %s, backing off 30s…", sym)
-                time.sleep(30)
-                try:
-                    ref_rows, pricing_rows = _fetch_yf_options(sym, today_ts)
-                    r, p = _upsert_yf_options(conn, ref_rows, pricing_rows)
-                    total_ref += r
-                    total_pricing += p
-                except Exception as retry_exc:
-                    log.warning("  yfinance retry failed for %s: %s", sym, retry_exc)
-                    conn.rollback()
-            else:
+                if is_rate_limited and attempt < len(backoff_schedule):
+                    wait = backoff_schedule[attempt]
+                    attempt += 1
+                    log.warning(
+                        "  yfinance rate-limited on %s; sleeping %ds (attempt %d/%d)…",
+                        sym, wait, attempt, len(backoff_schedule),
+                    )
+                    time.sleep(wait)
+                    continue
                 log.warning("  yfinance options skipping %s: %s", sym, exc)
+                break
+
+        if i % 25 == 0:
+            log.info(
+                "  yfinance options: %d/%d underlyings, %d ref / %d pricing rows",
+                i, len(universe), total_ref, total_pricing,
+            )
 
     log.info(
         "yfinance options: upserted %d reference, %d pricing rows total.",
